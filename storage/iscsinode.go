@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -21,6 +23,8 @@ import (
 	"k8s.io/kubernetes/pkg/util/mount"
 	"k8s.io/kubernetes/pkg/volume/util"
 )
+
+var trackingFilePath = "/var/lib/infinidat/tracking/"
 
 type iscsiDisk struct {
 	Portals         []string
@@ -54,6 +58,19 @@ type iscsiDiskUnmounter struct {
 	*iscsiDisk
 	mounter mount.Interface
 	exec    mount.Exec
+}
+
+type volumePublishInfo struct {
+	VolumeName  string   `json:"volume_name,omitempty"`
+	Lun         int      `json:"lun,omitempty"`
+	DoDiscovery bool     `json:"do_discovery,omitempty"`
+	Targets     []target `json:"targets,omitempty"`
+}
+
+type target struct {
+	Iqn    string `json:"iqn,omitempty"`
+	Portal string `json:"portal,omitempty"`
+	Port   string `json:"port,omitempty"`
 }
 
 func (iscsi *iscsistorage) NodePublishVolume(
@@ -131,6 +148,17 @@ func (iscsi *iscsistorage) AttachDisk(d iscsiDiskMounter) (mntPath string, err e
 
 	// Mount device
 	mntPath = d.targetPath
+	err = d.mounter.MakeDir(filepath.Dir(trackingFilePath))
+	if err != nil {
+		log.Errorf("failed to create target directory %q: %v", filepath.Dir(d.targetPath), err)
+		//return "", fmt.Errorf("failed to create target directory for raw block bind mount: %v", err)
+	}
+	trackingFile := trackingFilePath + d.VolName + ".json"
+	err = writeStagedTargetPath(trackingFile, mntPath)
+	log.Debug("error while writing writeStagedTargetPath : ", err)
+	if err != nil {
+		log.Debug("Failed to add stagingTargetPath")
+	}
 	notMnt, err := d.mounter.IsLikelyNotMountPoint(mntPath)
 	if err != nil && !os.IsNotExist(err) {
 		return "", fmt.Errorf("Could not validate mount point, error :%v", err)
@@ -539,5 +567,222 @@ func (iscsi *iscsistorage) NodeGetVolumeStats(
 }
 
 func (iscsi *iscsistorage) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
-	return &csi.NodeExpandVolumeResponse{}, status.Error(codes.Unimplemented, time.Now().String())
+	var err error
+	defer func() {
+		if res := recover(); res != nil && err == nil {
+			err = errors.New("Recovered from ISCSI AttachDisk  " + fmt.Sprint(res))
+		}
+	}()
+	log.Debug("It is new n=build----------------------------------------")
+	volumeID := req.GetVolumeId()
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "no volume ID provided")
+	}
+
+	volumePath := req.GetVolumePath()
+	if volumePath == "" {
+		return nil, status.Error(codes.InvalidArgument, "no volume path provided")
+	}
+
+	capacity := int64(req.GetCapacityRange().GetRequiredBytes())
+	if capacity < gib {
+		capacity = gib
+		log.Warn("Volume Minimum capacity should be greater 1 GB")
+	}
+
+	//Check volume exist or not
+	log.Debug("staging Target path : ", req.GetStagingTargetPath())
+	log.Debug("Target path : ", req.GetVolumePath())
+	if _, err := os.Stat(volumePath); os.IsNotExist(err) {
+		return nil, status.Errorf(codes.Internal, "unable to find volume publish info needed for resize")
+	}
+	log.WithFields(log.Fields{
+		"volumeId":      volumeID,
+		"volumePath":    volumePath,
+		"requiredBytes": capacity,
+		"filepath":      volumePath,
+	}).Debug("NodeExpandVolumeRequest values")
+	//Trident Solution
+	filePath := volumePath + volumeID + ".json"
+	publishInfo, err := readStagedDeviceInfo(filePath)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, err.Error())
+	}
+	log.Debug("publishInfo : ", publishInfo)
+	lunID := int(publishInfo.Lun)
+
+	for _, target := range publishInfo.Targets {
+		log.Debugf("Rescan targetIqn: %s, portal: %s\n", target.Iqn, target.Portal)
+		baseArgs := []string{"-m", "node", "-T", target.Iqn, "-p", target.Portal}
+		// Rescan sessions to discover newly mapped LUNs. Do not specify the interface when rescanning
+		// to avoid establishing additional sessions to the same target.
+		if _, err := execCommand("iscsiadm", append(baseArgs, []string{"-R"}...)...); err != nil {
+			log.Debugf("Failed to rescan session, err: %v", err)
+		}
+	}
+
+	log.WithFields(log.Fields{
+		"lunID": lunID,
+	}).Debug("PublishInfo for device to expand.")
+	//Expand volume size
+	size, err := expandFilesystem("resize2fs", filePath, volumePath)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, err.Error())
+	}
+
+	//ceph solution
+	// volumePath = "/var/lib/kubelet/pods/9591c330-fb5c-44dd-8503-0fa89d4de160/volumes/kubernetes.io~csi/csi-0cadf25803/mount"
+	// log.Debug("Volume path : ", volumePath)
+	// notMnt, err := mount.PathExists(volumePath)
+	// log.Debug("-----------------------------Mount path : ", notMnt)
+	// log.Debug("-----------------------------Mount path  err : ", err)
+	// if err != nil {
+	// 	log.Debug("err after mount.PathExists : ", err)
+	// 	if os.IsNotExist(err) {
+	// 		return nil, status.Error(codes.NotFound, err.Error())
+	// 	}
+	// 	return nil, status.Error(codes.Internal, err.Error())
+	// }
+	// if !notMnt {
+	// 	return &csi.NodeExpandVolumeResponse{}, nil
+	// }
+
+	// devicePath, err := getDevicePath(ctx, volumePath)
+	// if err != nil {
+	// 	return nil, status.Error(codes.Internal, err.Error())
+	// }
+	//var ns iscsiDiskMounter
+	//diskMounter := &mount.SafeFormatAndMount{Interface: ns.mountInterface, Exec: ns.exec}
+	// log.Debug("Able to create diskMounter object : ", diskMounter)
+	// // TODO check size and return success or errorgo build
+	// mountPoint := volumePath
+	// volumePath += "/18425.json"
+	//resizer := resizefs.NewResizeFs(diskMounter)
+	// log.Debug("Able to create resizer object : ", resizer)
+	// log.Debug("Noe volume path : ", volumePath)
+	// log.Debug("mountPoint : ", mountPoint)
+	// log.Debug("volumePath : ", volumePath)
+	//ok, err := resizer.Resize(volumePath, mountPoint)
+	// log.Debug("-------------ok : ", ok)
+	// log.Debug("-------------err : ", err)
+	// if ok {
+	// 	log.Debug("Filesystem expanded by size")
+	// }
+	log.Debug("Filesystem expanded by size ", size)
+	return &csi.NodeExpandVolumeResponse{}, err
+}
+
+func readStagedDeviceInfo(stagingTargetPath string) (*volumePublishInfo, error) {
+
+	var publishInfo volumePublishInfo
+
+	publishInfoBytes, err := ioutil.ReadFile(stagingTargetPath)
+	if err != nil {
+		return nil, err
+	}
+
+	err = json.Unmarshal(publishInfoBytes, &publishInfo)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Debug("Publish Info found")
+	return &publishInfo, nil
+}
+
+func execCommand(name string, args ...string) ([]byte, error) {
+
+	log.WithFields(log.Fields{
+		"command": name,
+		"args":    args,
+	}).Debug("Execute command ")
+
+	out, err := exec.Command(name, args...).CombinedOutput()
+
+	log.WithFields(log.Fields{
+		"command": name,
+		"output":  string(out),
+		"error":   err,
+	}).Debug("Executed command ")
+
+	return out, err
+}
+
+func getFilesystemSize(path string) (int64, error) {
+	var buf syscall.Statfs_t
+	err := syscall.Statfs(path, &buf)
+	if err != nil {
+		log.WithField("path", path).Errorf("Failed to statfs: %s", err)
+		return 0, fmt.Errorf("couldn't get filesystem stats %s: %s", path, err)
+	}
+
+	size := int64(buf.Blocks) * buf.Bsize
+	log.WithFields(log.Fields{
+		"path":  path,
+		"size":  size,
+		"avail": buf.Bavail,
+		"free":  buf.Bfree,
+	}).Debug("Filesystem size information")
+	return size, nil
+}
+
+func expandFilesystem(cmd string, cmdArguments string, tmpMountPoint string) (int64, error) {
+	preExpandSize, err := getFilesystemSize(tmpMountPoint)
+	if err != nil {
+		return 0, err
+	}
+
+	// _, err = execCommand("bash", "-c")
+	// if err != nil {
+	// 	log.Errorf("pvresize filesystem failed; %s", err)
+	// 	return 0, err
+	// }
+	//iscsiMounter := iscsiDiskMounter{mounter: &mount.SafeFormatAndMount{Interface: mount.New(""), Exec: mount.NewOsExec()}}
+	// _, err = execCommand("bash", "-c", "pvresize", "/dev/sdbd")
+	// if err != nil {
+	// 	log.Errorf("pvresize filesystem failed; %s", err)
+	// 	return 0, err
+	// }
+	// //lvextend -l +100%PVS LV_Name /dev/mapper/mpath1
+	// _, err = execCommand("bash", "-c", "lvextend", "-l", "+100%PVS", cmdArguments, "/dev/sdbd")
+	// if err != nil {
+	// 	log.Errorf("pvresize filesystem failed; %s", err)
+	// 	return 0, err
+	// }
+
+	_, err = execCommand(cmd, cmdArguments)
+	if err != nil {
+		log.Errorf("Expanding filesystem failed; %s", err)
+		return 0, err
+	}
+
+	postExpandSize, err := getFilesystemSize(tmpMountPoint)
+	if err != nil {
+		return 0, err
+	}
+
+	if postExpandSize == preExpandSize {
+		log.Warnf("Failed to expand filesystem; size=%d", postExpandSize)
+	}
+
+	return postExpandSize, nil
+}
+
+func writeStagedTargetPath(filepath string, stagingTargetPath string) error {
+	data := map[string]string{"targetPath": stagingTargetPath}
+	log.Debug("Data dictionary : ", data)
+	volumeTrackingPublishInfoBytes, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+
+	if err := ioutil.WriteFile(filepath, volumeTrackingPublishInfoBytes, 0600); err != nil {
+		log.WithFields(log.Fields{
+			"TargetPath": filepath,
+			"error":      err.Error(),
+		}).Error("Unable to write tracking file.")
+		return err
+	}
+
+	return nil
 }

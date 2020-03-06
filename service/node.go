@@ -125,16 +125,20 @@ func (s *service) NodeGetVolumeStats(
 }
 
 func (s *service) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
-	var err error
-	defer func() {
-		if res := recover(); res != nil && err == nil {
-			err = errors.New("Recovered from ISCSI NodePublishVolume " + fmt.Sprint(res))
-		}
-	}()
-	volID := req.GetVolumeId()
-	if len(volID) == 0 {
-		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
+	volproto, err := s.validateStorageType(req.GetVolumeId())
+	if err != nil {
+		return &csi.NodeExpandVolumeResponse{}, status.Error(codes.Internal, err.Error())
 	}
+	log.Infof("NodeExpandVolume called with volume ID : ", volproto.VolumeID)
+	config := make(map[string]string)
+	config["nodeIPAddress"] = s.nodeIPAddress
+	log.Debug("NodePublishVolume nodeIPAddress ", s.nodeIPAddress)
 
-	return &csi.NodeExpandVolumeResponse{}, nil
+	storageNode, err := storage.NewStorageNode(volproto.StorageType, config)
+	if storageNode != nil {
+		req.VolumeId = volproto.VolumeID
+		return storageNode.NodeExpandVolume(ctx, req)
+	}
+	log.Error("Error Occured: ", err)
+	return &csi.NodeExpandVolumeResponse{}, status.Error(codes.Internal, err.Error())
 }
